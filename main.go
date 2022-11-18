@@ -1,53 +1,32 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-func init() {
-	flag.IntVar(&timeout, "t", 0, "Period of testing (in seconds)")
-	flag.Int64Var(&requests, "r", -1, "Number of requests per client, -1=unlimited")
-	flag.IntVar(&clients, "c", 100, "Number of concurrent clients")
-	flag.StringVar(&target, "u", "", "Target URL (e.g. 127.0.0.1:12345 or tracker.example.org:1337)")
-	flag.BoolVar(&keepAlive, "k", false, "Re-use connection IDs")
-	flag.BoolVar(&scrapeMode, "s", false, "Scrape instead of announcing")
-	flag.BoolVar(&errorReporting, "e", false, "Enable detailed error reporting")
-	flag.BoolVar(&seeder, "f", false, "Send seeder announces (left=0)")
-
-	var infoh = uint64(rand.Int63())
-	ih = &infoh
-
-	var peerid = uint64(rand.Int63())
-	pid = &peerid
-
-	var transid = rand.Uint32()
-	tid = &transid
-}
-
-// Global transactionID, infohash and peerID counters.
+// Global transactionID, infoHash and peerID counters.
 var (
-	tid *uint32
-	ih  *uint64
-	pid *uint64
+	infoHashCnt      atomic.Uint64
+	peerIDCnt        atomic.Uint64
+	transactionIDCnt atomic.Uint32
 )
 
 // Flags.
 var (
 	timeout        int
-	requests       int64
+	requests       int
 	clients        int
 	target         string
 	keepAlive      bool
@@ -56,11 +35,33 @@ var (
 	seeder         bool
 )
 
-const readTimeout time.Duration = time.Second * 2
+const (
+	readTimeout   = time.Second * 2
+	udpPacketSize = 98
+)
+
+var udpConnectHeader = []byte{0x0, 0x0, 0x4, 0x17, 0x27, 0x10, 0x19, 0x80}
+
+func init() {
+	flag.IntVar(&timeout, "t", 0, "Period of testing (in seconds)")
+	flag.IntVar(&requests, "r", -1, "Number of requests per client, -1=unlimited")
+	flag.IntVar(&clients, "c", 100, "Number of concurrent clients")
+	flag.StringVar(&target, "u", "", "Target URL (e.g. 127.0.0.1:12345 or tracker.example.org:1337)")
+	flag.BoolVar(&keepAlive, "k", false, "Re-use connection IDs")
+	flag.BoolVar(&scrapeMode, "s", false, "Scrape instead of announcing")
+	flag.BoolVar(&errorReporting, "e", false, "Enable detailed error reporting")
+	flag.BoolVar(&seeder, "f", false, "Send seeder announces (left=0)")
+
+	rand.Seed(time.Now().UnixNano())
+
+	infoHashCnt.Store(rand.Uint64())
+	peerIDCnt.Store(rand.Uint64())
+	transactionIDCnt.Store(rand.Uint32())
+}
 
 type configuration struct {
 	url        string
-	requests   int64
+	requests   int
 	period     time.Duration
 	keepAlive  bool
 	scrapeMode bool
@@ -68,20 +69,17 @@ type configuration struct {
 }
 
 type result struct {
-	connectAttempts int64
-	failedConnects  int64
-	requests        int64
-	success         int64
-	failed          int64
-	errors          map[string]int64
+	connectAttempts int
+	failedConnects  int
+	requests        int
+	success         int
+	failed          int
+	errors          map[error]int
 }
 
 type client struct {
-	conn          net.Conn
-	result        *result
-	infohash      *uint64
-	peerID        *uint64
-	transactionID *uint32
+	conn   net.Conn
+	result *result
 }
 
 func main() {
@@ -104,29 +102,24 @@ func main() {
 	wg.Add(clients)
 	startTime := time.Now()
 	for i := 0; i < clients; i++ {
-		result := &result{
-			errors: make(map[string]int64),
+		res := &result{
+			errors: make(map[error]int),
 		}
-		results[i] = result
+		results[i] = res
 
 		conn, err := net.Dial("udp", c.url)
 		if err != nil {
 			panic(err)
 		}
 
-		client := &client{
-			conn:          conn,
-			result:        result,
-			infohash:      ih,
-			peerID:        pid,
-			transactionID: tid,
-		}
-
-		go client.do(c, t, wg)
+		go client{
+			conn:   conn,
+			result: res,
+		}.do(c, t, wg)
 		go func() {
 			if c.period > 0 {
 				<-t
-				conn.SetReadDeadline(time.Now())
+				_ = conn.SetReadDeadline(time.Now())
 			}
 		}()
 	}
@@ -152,50 +145,46 @@ func newConfig() *configuration {
 		os.Exit(1)
 	}
 
-	configuration := &configuration{
+	conf := &configuration{
 		url:        target,
-		requests:   int64((1 << 63) - 1),
-		period:     time.Duration(0) * time.Second,
+		requests:   math.MaxInt64,
+		period:     0,
 		keepAlive:  keepAlive,
 		scrapeMode: scrapeMode,
 		seeder:     seeder,
 	}
 
 	if timeout > 0 {
-		configuration.period = time.Duration(timeout) * time.Second
+		conf.period = time.Duration(timeout) * time.Second
 	}
 
 	if requests != -1 {
-		configuration.requests = requests
+		conf.requests = requests
 	}
 
-	return configuration
+	return conf
 }
 
 func printResults(results []*result, runTime time.Duration, c *configuration) {
-	var requests int64
-	var success int64
-	var failed int64
-	var connectAttempts int64
-	var failedConnects int64
-	var timeouts int64
-	errors := make(map[string]int64)
+	var reqCount int
+	var succeeded int
+	var failed int
+	var connectAttempts int
+	var failedConnects int
+	var timeouts int
+	reqErrors := make(map[error]int)
 
-	for _, result := range results {
-		requests += result.requests
-		success += result.success
-		failed += result.failed
-		connectAttempts += result.connectAttempts
-		failedConnects += result.failedConnects
+	for _, res := range results {
+		reqCount += res.requests
+		succeeded += res.success
+		failed += res.failed
+		connectAttempts += res.connectAttempts
+		failedConnects += res.failedConnects
 		if errorReporting {
-			for err, count := range result.errors {
-				_, exists := errors[err]
-				if !exists {
-					errors[err] = 0
-				}
-				errors[err] += count
+			for err, count := range res.errors {
+				reqErrors[err] += count
 
-				if strings.Contains(err, "I/O timeout") {
+				if errors.Is(err, os.ErrDeadlineExceeded) {
 					timeouts += count
 				}
 			}
@@ -208,61 +197,66 @@ func printResults(results []*result, runTime time.Duration, c *configuration) {
 		elapsed = 1
 	}
 
-	//compute concurrency
+	// compute concurrency
 	workTime := float64(clients) * elapsed
 	realTime := workTime - (float64(timeouts) * readTimeout.Seconds())
 	concurrency := float64(clients) * (realTime / workTime)
 
 	fmt.Println()
-	fmt.Printf("Requests:                       %10d\n", requests)
-	fmt.Printf("Successful requests:            %10d\n", success)
-	fmt.Printf("failed requests:                %10d\n", failed)
+	fmt.Printf("Requests:                       %10d\n", reqCount)
+	fmt.Printf("Successful requests:            %10d\n", succeeded)
+	fmt.Printf("Failed requests:                %10d\n", failed)
 	fmt.Printf("Connect attempts:               %10d\n", connectAttempts)
 	fmt.Printf("Failed connects:                %10d\n", failedConnects)
-	fmt.Printf("Successful requests rate:       %10.0f hits/sec\n", float64(success)/elapsed)
+	fmt.Printf("Successful requests rate:       %10.0f hits/sec\n", float64(succeeded)/elapsed)
 	if c.period > 0 {
 		fmt.Printf("Approximate concurrency:        %10.2f clients running\n", concurrency)
 	}
 	fmt.Printf("Test time:                      %10.2f sec\n", elapsed)
 	if errorReporting {
 		fmt.Println("Errors encountered:")
-		for err, count := range errors {
-			fmt.Printf("    %30s  %10d\n", err, count)
+		for err, count := range reqErrors {
+			fmt.Printf("    %30v  %10d\n", err, count)
 		}
 	}
 }
 
-func (r *result) incrementError(err string, t chan struct{}) {
-	if errorReporting {
-		if strings.Contains(err, "I/O timeout") {
-			select {
-			case <-t:
-				//timeout because we're done
-				return
-			default:
-			}
+func checkDeadLine(err error, t chan struct{}) (inc int) {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		select {
+		case <-t:
+			// timeout because we're done
+			return
+		default:
+			inc = 1
 		}
-		_, exists := r.errors[err]
-		if !exists {
-			r.errors[err] = 0
-		}
+	} else {
+		inc = 1
+	}
+	return
+}
+
+func (r *result) incrementError(err error, t chan struct{}) (inc int) {
+	if inc = checkDeadLine(err, t); inc > 0 && errorReporting {
 		r.errors[err]++
 	}
+	return
 }
 
-func (c *client) do(conf *configuration, t chan struct{}, wg *sync.WaitGroup) {
+func (c client) do(conf *configuration, t chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
-	// Prepare a packet.
-	packet, err := prepareAnnounce(conf.seeder)
-	if err != nil {
-		panic(fmt.Sprintf("Unable to create packet: %s", err.Error()))
-	}
+	var err error
 
-	// Prepare a receive buffer.
+	// Prepare a receipt buffer.
 	buf := make([]byte, 1024)
 
 	// Get a transaction ID.
-	transactionID := atomic.AddUint32(c.transactionID, 1)
+	trID := transactionIDCnt.Add(1)
+
+	rg := &xoroshiro128p{peerIDCnt.Add(1), infoHashCnt.Add(1)}
+
+	// Prepare a packet.
+	packet := prepareAnnounce(conf.seeder, rg.next())
 
 	var connectionID uint64
 	var connectionIDExpired <-chan time.Time
@@ -281,10 +275,10 @@ loop:
 		if conf.keepAlive {
 			if connectionIDExpired == nil {
 				// Initial connect or fast reconnect.
-				transactionID = atomic.AddUint32(c.transactionID, 1)
-				connectionID, err = c.connect(transactionID)
+				trID = transactionIDCnt.Add(1)
+				connectionID, err = c.connect(trID, t)
 				if err != nil {
-					c.result.incrementError(err.Error(), t)
+					c.result.incrementError(err, t)
 					continue loop
 				}
 				connectionIDExpired = time.After(time.Minute)
@@ -292,10 +286,10 @@ loop:
 				select {
 				case <-connectionIDExpired:
 					// Reconnect.
-					transactionID = atomic.AddUint32(c.transactionID, 1)
-					connectionID, err = c.connect(transactionID)
+					trID = transactionIDCnt.Add(1)
+					connectionID, err = c.connect(trID, t)
 					if err != nil {
-						c.result.incrementError(err.Error(), t)
+						c.result.incrementError(err, t)
 						connectionIDExpired = nil // Do a fast reconnect.
 						continue loop
 					}
@@ -305,138 +299,83 @@ loop:
 			}
 		} else {
 			// Reconnect on every request.
-			transactionID = atomic.AddUint32(c.transactionID, 1)
-			connectionID, err = c.connect(transactionID)
+			trID = transactionIDCnt.Add(1)
+			connectionID, err = c.connect(trID, t)
 			if err != nil {
-				c.result.incrementError(err.Error(), t)
+				c.result.incrementError(err, t)
 				continue loop
 			}
 		}
 
-		transactionID = atomic.AddUint32(c.transactionID, 1)
-		infohash := atomic.AddUint64(c.infohash, 1)
-		peerID := atomic.AddUint64(c.peerID, 1)
-
-		err = c.announce(buf, packet, transactionID, connectionID, infohash, peerID)
+		err = c.announce(buf, packet,
+			transactionIDCnt.Add(1),
+			connectionID,
+			rg.nextIH(),
+			peerIDCnt.Add(1))
 		c.result.requests++
 		if err != nil {
-			c.result.incrementError(err.Error(), t)
-			c.result.failed++
+			c.result.failed += c.result.incrementError(err, t)
 		} else {
 			c.result.success++
 		}
 	}
 }
 
-func prepareAnnounce(seeder bool) ([]byte, error) {
-	bbuf := bytes.NewBuffer(nil)
-
-	// Connection id
-	_, err := bbuf.Write([]byte{0, 0, 0, 0, 0, 0, 0, 0})
-	if err != nil {
-		return nil, err
-	}
-
+func prepareAnnounce(seeder bool, rn uint64) []byte {
+	bb := make([]byte, udpPacketSize)
 	// Action
-	_, err = bbuf.Write([]byte{0, 0, 0, 0x01})
-	if err != nil {
-		return nil, err
-	}
-
-	// Transaction ID
-	_, err = bbuf.Write([]byte{0, 0, 0, 0})
-	if err != nil {
-		return nil, err
-	}
-
-	// Infohash
-	_, err = bbuf.WriteString("xxxxxxxxxxxxxxxxxxxx")
-	if err != nil {
-		return nil, err
-	}
-
-	// Peer ID
-	_, err = bbuf.WriteString("xxxxxxxxxxxxxxxxxxxx")
-	if err != nil {
-		return nil, err
-	}
-
-	// Downloaded
-	_, err = bbuf.Write([]byte{0, 0, 0, 0, 0, 0, 0, 0})
-	if err != nil {
-		return nil, err
-	}
-
-	// Left
-	if seeder {
-		_, err = bbuf.Write([]byte{0, 0, 0, 0, 0, 0, 0, 0})
-	} else {
-		_, err = bbuf.Write([]byte{0, 0, 0, 0, 0, 0, 0, 0x01})
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	// Uploaded
-	_, err = bbuf.Write([]byte{0, 0, 0, 0, 0, 0, 0, 0})
-	if err != nil {
-		return nil, err
+	bb[11] = 1
+	if !seeder {
+		bb[71] = 1
 	}
 
 	// Event
-	_, err = bbuf.Write([]byte{0, 0, 0, 0x02})
-	if err != nil {
-		return nil, err
-	}
-
-	// IP Address
-	_, err = bbuf.Write([]byte{0, 0, 0, 0})
-	if err != nil {
-		return nil, err
-	}
-
-	// "Key"
-	_, err = bbuf.Write([]byte{0, 0, 0, 0})
-	if err != nil {
-		return nil, err
-	}
+	bb[83] = 2
 
 	// Numwant
-	_, err = bbuf.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF})
-	if err != nil {
-		return nil, err
-	}
+	bb[92], bb[95] = byte(rn>>24), byte(rn>>16)
 
 	// Port
-	_, err = bbuf.Write([]byte{0x05, 0x00})
-	if err != nil {
-		return nil, err
-	}
+	bb[96], bb[97] = byte(rn>>8), byte(rn)
 
-	return bbuf.Bytes(), nil
+	return bb
 }
 
-func (c *client) announce(buf, packet []byte, transactionID uint32, connectionID, infohash, peerID uint64) error {
-	c.conn.SetReadDeadline(time.Now().Add(readTimeout))
+type xoroshiro128p struct {
+	s0, s1 uint64
+}
+
+func (x *xoroshiro128p) next() (result uint64) {
+	s0, s1 := x.s0, x.s1
+	result = s0 + s1
+	s1 ^= s0
+	x.s0 = ((s0 << 24) | (s0 >> 40)) ^ s1 ^ (s1 << 16) // rotl(s0, 24) ^ s1 ^ (s1 << 16)
+	x.s1 = (s1 << 37) | (s1 >> 27)                     // rotl(s1, 37)
+	return
+}
+
+func (x *xoroshiro128p) nextIH() []byte {
+	res := make([]byte, sha1.Size)
+	binary.BigEndian.PutUint64(res[:8], x.next())
+	binary.BigEndian.PutUint64(res[8:16], x.next())
+	binary.BigEndian.PutUint32(res[16:], uint32(x.next()))
+	return res
+}
+
+var (
+	errTruncatedTx           = errors.New("packet was not fully sent to server")
+	errTruncatedRx           = errors.New("packet was not fully received from server")
+	errUnexpectedAction      = errors.New("tracker responded with unexpected action")
+	errTransactionIDMismatch = errors.New("mismatch sent and received transaction IDs")
+)
+
+func (c client) announce(buf, packet []byte, transactionID uint32, connectionID uint64, infoHash []byte, peerID uint64) error {
+	_ = c.conn.SetReadDeadline(time.Now().Add(readTimeout))
 
 	binary.BigEndian.PutUint64(packet[0:8], connectionID)
 	binary.BigEndian.PutUint32(packet[12:16], transactionID)
-
-	infohashBytes := sha1.Sum([]byte{byte(infohash >> 56),
-		byte(infohash >> 48),
-		byte(infohash >> 40),
-		byte(infohash >> 32),
-		byte(infohash >> 24),
-		byte(infohash >> 16),
-		byte(infohash >> 8),
-		byte(infohash)})
-
-	peerIDString := fmt.Sprintf("%020x", peerID)
-
-	for i := 0; i < 20; i++ {
-		packet[16+i] = infohashBytes[i]
-		packet[36+i] = peerIDString[i]
-	}
+	copy(packet[16:36], infoHash)
+	copy(packet[36:56], fmt.Sprintf("%020x", peerID))
 
 	// Send announce.
 	n, err := c.conn.Write(packet)
@@ -444,19 +383,16 @@ func (c *client) announce(buf, packet []byte, transactionID uint32, connectionID
 		return err
 	}
 	if n != 98 {
-		return errors.New("announce: Did not send 98 bytes")
+		return errTruncatedTx
 	}
 
 	// Receive response.
 	n, err = c.conn.Read(buf)
 	if err != nil {
-		if strings.HasSuffix(err.Error(), "i/o timeout") {
-			return errors.New("announce: I/O timeout on receive")
-		}
-		return fmt.Errorf("announce: %s", err)
+		return err
 	}
 	if n < 20 {
-		return errors.New("announce: Did not receive at least 20 bytes")
+		return errTruncatedRx
 	}
 
 	// Parse action.
@@ -464,36 +400,30 @@ func (c *client) announce(buf, packet []byte, transactionID uint32, connectionID
 	if action != 1 {
 		if action == 3 {
 			errVal := string(buf[8:n])
-			return fmt.Errorf("announce: tracker responded with error: %s", errVal)
+			return fmt.Errorf("tracker error: %s", errVal)
 		}
-		return errors.New("announce: tracker responded with action != 1")
+		return errUnexpectedAction
 	}
 
 	transID := binary.BigEndian.Uint32(buf[4:8])
 	if transID != transactionID {
-		return errors.New("announce: transaction IDs do not match")
+		return errTransactionIDMismatch
 	}
 
 	return nil
 }
 
-func (c *client) connect(transactionID uint32) (u uint64, err error) {
-	c.conn.SetReadDeadline(time.Now().Add(readTimeout))
+func (c client) connect(transactionID uint32, t chan struct{}) (u uint64, err error) {
+	_ = c.conn.SetReadDeadline(time.Now().Add(readTimeout))
 
 	c.result.connectAttempts++
 	defer func() {
 		if err != nil {
-			c.result.failedConnects++
+			c.result.failedConnects += checkDeadLine(err, t)
 		}
 	}()
 	buf := make([]byte, 16)
-
-	buf[2] = 0x04
-	buf[3] = 0x17
-	buf[4] = 0x27
-	buf[5] = 0x10
-	buf[6] = 0x19
-	buf[7] = 0x80
+	copy(buf, udpConnectHeader)
 
 	binary.BigEndian.PutUint32(buf[12:16], transactionID)
 
@@ -503,32 +433,29 @@ func (c *client) connect(transactionID uint32) (u uint64, err error) {
 	}
 
 	if n != 16 {
-		return 0, errors.New("connect: Did not send 16 bytes")
+		return 0, errTruncatedTx
 	}
 
 	buf = make([]byte, 64)
 	n, err = c.conn.Read(buf)
 	if err != nil {
-		if strings.HasSuffix(err.Error(), "i/o timeout") {
-			return 0, errors.New("connect: I/O timeout on receive")
-		}
-		return 0, fmt.Errorf("connect: %s", err)
+		return 0, err
 	}
 
 	if n != 16 {
-		return 0, errors.New("connect: Did not receive 16 bytes")
+		return 0, errTruncatedTx
 	}
 
 	b := buf[:n]
 
 	action := binary.BigEndian.Uint32(b[:4])
 	if action != 0 {
-		return 0, errors.New("connect: action != 0")
+		return 0, errUnexpectedAction
 	}
 
 	transID := binary.BigEndian.Uint32(b[4:8])
 	if transID != transactionID {
-		return 0, errors.New("connect: transaction IDs do not match")
+		return 0, errTransactionIDMismatch
 	}
 
 	connID := binary.BigEndian.Uint64(b[8:16])
